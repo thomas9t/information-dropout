@@ -14,12 +14,13 @@ def main():
     X_test = X_test.reshape(
         X_test.shape[0], 28, 28, 1).astype(np.float32) / 255.0
 
-    beta = 1e-4
+    beta = 1
     input_shape = X_train[0].shape
     sigma = 1.0
     step_size_init = 0.001
     batch_size = 128
     max_epochs = 100
+    dropout = True
 
     linear = None
     encoder_input = tf.placeholder(tf.float32, shape=(None, 28, 28, 1))
@@ -32,18 +33,21 @@ def main():
             activation=tf.nn.relu,
             padding="same")(x)
     x = tf.layers.MaxPooling2D((2,2), strides=(2,2))(x)
-    encoder_output = information_dropout(x)
-    x = tf.layers.Flatten()(x)
+    encoder_output = information_dropout(x, dropout=dropout)
+    x = tf.layers.Flatten()(encoder_output)
     x = tf.layers.Dense(256, activation=tf.nn.relu)(x)
     decoder_output = tf.layers.Dense(10, activation=None)(x)
 
     cross_entropy_cost = tf.reduce_mean(
         tf.nn.softmax_cross_entropy_with_logits(labels=y_, logits=decoder_output))
     
-    kl_penalties = [tf.reduce_sum(kl) / float(batch_size) 
-                       for kl in tf.get_collection("kl_terms")]
-    kl_cost = tf.add_n(kl_penalties)
-    global_cost = cross_entropy_cost + beta*kl_cost
+    if dropout:
+        kl_penalties = [tf.reduce_sum(kl) / float(batch_size) 
+                        for kl in tf.get_collection("kl_terms")]
+        kl_cost = tf.add_n(kl_penalties)
+        global_cost = cross_entropy_cost + beta*kl_cost
+    else:
+        global_cost = cross_entropy_cost
 
     global_step = tf.Variable(0, trainable=False)
     step_size = tf.train.exponential_decay(
@@ -70,13 +74,35 @@ def main():
                 train_accuracy.append(
                     sess.run(accuracy_op, feed_dict={encoder_input: X, y_: Y}))
 
-            test_iterator = batch_iterator(X_train, Y_train)
+            test_iterator = batch_iterator(X_test, Y_test)
             test_accuracy = []
             for X, Y in test_iterator:
                 test_accuracy.append(
                     sess.run(accuracy_op, feed_dict={encoder_input: X, y_: Y}))
             print("Epoch: {} => {}/{}".format(
                 e, np.mean(train_accuracy), np.mean(test_accuracy)))
+
+        # get the encoder output
+        test_iterator = batch_iterator(X_test, Y_test)
+        codewords = []
+        true_labels = []
+        for X, Y in test_iterator:
+            codewords.append(
+                sess.run(encoder_output, feed_dict={encoder_input: X}))
+            true_labels.append(np.argmax(Y, axis=1))
+        print np.array(codewords).shape
+        dropout_stub = "with" if dropout else "no"
+        np.save("codewords_{}_dropout".format(dropout_stub), np.array(codewords))
+        np.save("true_labels_{}_dropout".format(dropout_stub), np.array(true_labels))
+
+        test_iterator = batch_iterator(X_test, Y_test)
+        codewords = []
+        for X, Y in test_iterator:
+            codewords.append(
+                sess.run(decoder_output, feed_dict={encoder_input: X}))
+        print np.array(codewords).shape
+        dropout_stub = "with" if dropout else "no"
+        np.save("logits_{}_dropout".format(dropout_stub), np.array(codewords))
 
 
 def batch_iterator(X, Y, batch_size=128):
@@ -91,7 +117,7 @@ def sample_lognormal(mean, sigma=None, sigma0=1.):
     return tf.exp(mean + sigma * sigma0 * e)
 
 
-def information_dropout(inputs, stride=2, max_alpha=0.7, sigma0=1.0):
+def information_dropout(inputs, stride=2, max_alpha=0.7, sigma0=1.0, dropout=True):
     num_outputs = inputs.get_shape()[-1]
 
     # compute the noiseless output using a convolutional layer
@@ -101,19 +127,23 @@ def information_dropout(inputs, stride=2, max_alpha=0.7, sigma0=1.0):
         activation_fn=tf.nn.relu,
         stride=stride)
 
-    with tf.variable_scope(None, "information_dropout"):
-        alpha = max_alpha * conv2d(inputs,
-            num_outputs=num_outputs,
-            kernel_size=3,
-            stride=stride,
-            activation_fn=tf.sigmoid,
-            scope="alpha")
-        alpha = 1e-3 + max_alpha*alpha
+    if dropout:
+        with tf.variable_scope(None, "information_dropout"):
+            alpha = max_alpha * conv2d(inputs,
+                num_outputs=num_outputs,
+                kernel_size=3,
+                stride=stride,
+                activation_fn=tf.sigmoid,
+                scope="alpha")
+            alpha = 1e-3 + max_alpha*alpha
 
-        kl = -tf.log(alpha/(max_alpha + 1e-3))
-        tf.add_to_collection("kl_terms", kl)
-    
-    e = sample_lognormal(mean=tf.zeros_like(network), sigma=alpha, sigma0=sigma0)
+            kl = -tf.log(alpha/(max_alpha + 1e-3))
+            tf.add_to_collection("kl_terms", kl)
+        
+        e = sample_lognormal(mean=tf.zeros_like(network), sigma=alpha, sigma0=sigma0)
+    else:
+        e = 1.0
+
     return network * e
 
 
